@@ -1,188 +1,93 @@
-import glob
 import os
-import time
-import pickle
 
-from colorama import Fore, Style
-from tensorflow import keras
-from google.cloud import storage
+import requests
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+from prefect import task, flow
 
+from taxifare.interface.main import evaluate, preprocess, train
+from taxifare.ml_logic.registry import mlflow_transition_model
 from taxifare.params import *
-import mlflow
-from mlflow.tracking import MlflowClient
 
-def save_results(params: dict, metrics: dict) -> None:
+@task
+def preprocess_new_data(min_date: str, max_date: str):
+
+    return preprocess(min_date=min_date, max_date=max_date)
+
+
+@task
+def evaluate_production_model(min_date: str, max_date: str):
+
+    return evaluate(min_date=min_date, max_date=max_date)
+
+
+@task
+def re_train(min_date: str, max_date: str, split_ratio: str):
+
+    return train(min_date=min_date, max_date=max_date, split_ratio=split_ratio)
+
+
+@task
+def transition_model(current_stage: str, new_stage: str):
+
+    return mlflow_transition_model(current_stage=current_stage, new_stage=new_stage)
+
+
+
+@task
+def notify(old_mae, new_mae):
     """
-    Persist params & metrics locally on the hard drive at
-    "{LOCAL_REGISTRY_PATH}/params/{current_timestamp}.pickle"
-    "{LOCAL_REGISTRY_PATH}/metrics/{current_timestamp}.pickle"
-    - (unit 03 only) if MODEL_TARGET='mlflow', also persist them on MLflow
+    Notify about the performance
     """
-    if MODEL_TARGET == "mlflow":
-        pass  # YOUR CODE HERE
+    base_url = 'https://chat.api.lewagon.com'
+    channel = '198'
+    url = f"{base_url}/{channel}/messages"
+    author = 'alanoudniaf'
 
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-
-    # Save params locally
-    if params is not None:
-        params_path = os.path.join(LOCAL_REGISTRY_PATH, "params", timestamp + ".pickle")
-        with open(params_path, "wb") as file:
-            pickle.dump(params, file)
-
-    # Save metrics locally
-    if metrics is not None:
-        metrics_path = os.path.join(LOCAL_REGISTRY_PATH, "metrics", timestamp + ".pickle")
-        with open(metrics_path, "wb") as file:
-            pickle.dump(metrics, file)
-
-    print("✅ Results saved locally")
-
-
-def save_model(model: keras.Model = None) -> None:
-    """
-    Persist trained model locally on the hard drive at f"{LOCAL_REGISTRY_PATH}/models/{timestamp}.h5"
-    - if MODEL_TARGET='gcs', also persist it in your bucket on GCS at "models/{timestamp}.h5" --> unit 02 only
-    - if MODEL_TARGET='mlflow', also persist it on MLflow instead of GCS (for unit 0703 only) --> unit 03 only
-    """
-
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-
-    # Save model locally
-    model_path = os.path.join(LOCAL_REGISTRY_PATH, "models", f"{timestamp}.h5")
-    model.save(model_path)
-
-    print("✅ Model saved locally")
-
-    if MODEL_TARGET == "gcs":
-        # 🎁 We give you this piece of code as a gift. Please read it carefully! Add a breakpoint if needed!
-
-        model_filename = model_path.split("/")[-1] # e.g. "20230208-161047.h5" for instance
-        client = storage.Client()
-        bucket = client.bucket(BUCKET_NAME)
-        blob = bucket.blob(f"models/{model_filename}")
-        blob.upload_from_filename(model_path)
-
-        print("✅ Model saved to GCS")
-
-        return None
-
-    if MODEL_TARGET == "mlflow":
-        pass  # YOUR CODE HERE
-
-    return None
-
-
-def load_model(stage="Production") -> keras.Model:
-    """
-    Return a saved model:
-    - locally (latest one in alphabetical order)
-    - or from GCS (most recent one) if MODEL_TARGET=='gcs'  --> for unit 02 only
-    - or from MLFLOW (by "stage") if MODEL_TARGET=='mlflow' --> for unit 03 only
-
-    Return None (but do not Raise) if no model is found
-
-    """
-
-    if MODEL_TARGET == "local":
-        print(Fore.BLUE + f"\nLoad latest model from local registry..." + Style.RESET_ALL)
-
-        # Get the latest model version name by the timestamp on disk
-        local_model_directory = os.path.join(LOCAL_REGISTRY_PATH, "models")
-        local_model_paths = glob.glob(f"{local_model_directory}/*")
-
-        if not local_model_paths:
-            return None
-
-        most_recent_model_path_on_disk = sorted(local_model_paths)[-1]
-
-        print(Fore.BLUE + f"\nLoad latest model from disk..." + Style.RESET_ALL)
-
-        latest_model = keras.models.load_model(most_recent_model_path_on_disk)
-
-        print("✅ Model loaded from local disk")
-
-        return latest_model
-
-    elif MODEL_TARGET == "gcs":
-        # 🎁 We give you this piece of code as a gift. Please read it carefully! Add a breakpoint if needed!
-        print(Fore.BLUE + f"\nLoad latest model from GCS..." + Style.RESET_ALL)
-
-        client = storage.Client()
-        blobs = list(client.get_bucket(BUCKET_NAME).list_blobs(prefix="model"))
-
-        try:
-            latest_blob = max(blobs, key=lambda x: x.updated)
-            latest_model_path_to_save = os.path.join(LOCAL_REGISTRY_PATH, latest_blob.name)
-            latest_blob.download_to_filename(latest_model_path_to_save)
-
-            latest_model = keras.models.load_model(latest_model_path_to_save)
-
-            print("✅ Latest model downloaded from cloud storage")
-
-            return latest_model
-        except:
-            print(f"\n❌ No model found in GCS bucket {BUCKET_NAME}")
-
-            return None
-
-    elif MODEL_TARGET == "mlflow":
-        print(Fore.BLUE + f"\nLoad [{stage}] model from MLflow..." + Style.RESET_ALL)
-
-        # Load model from MLflow
-        model = None
-        pass  # YOUR CODE HERE
-        return model
+    if new_mae < old_mae and new_mae < 2.5:
+        content = f"🚀 New model replacing old in production with MAE: {new_mae} the Old MAE was: {old_mae}"
+    elif old_mae < 2.5:
+        content = f"✅ Old model still good enough: Old MAE: {old_mae} - New MAE: {new_mae}"
     else:
-        return None
+        content = f"🚨 No model good enough: Old MAE: {old_mae} - New MAE: {new_mae}"
+
+    data = dict(author=author, content=content)
+
+    response = requests.post(url, data=data)
+    response.raise_for_status()
 
 
-
-def mlflow_transition_model(current_stage: str, new_stage: str) -> None:
+@flow(name=PREFECT_FLOW_NAME)
+def train_flow():
     """
-    Transition the latest model from the `current_stage` to the
-    `new_stage` and archive the existing model in `new_stage`
+    Build the Prefect workflow for the `taxifare` package. It should:
+        - preprocess 1 month of new data, starting from EVALUATION_START_DATE
+        - compute `old_mae` by evaluating the current production model in this new month period
+        - compute `new_mae` by re-training, then evaluating the current production model on this new month period
+        - if the new one is better than the old one, replace the current production model with the new one
+        - if neither model is good enough, send a notification!
     """
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 
-    client = MlflowClient()
-
-    version = client.get_latest_versions(name=MLFLOW_MODEL_NAME, stages=[current_stage])
-
-    if not version:
-        print(f"\n❌ No model found with name {MLFLOW_MODEL_NAME} in stage {current_stage}")
-        return None
-
-    client.transition_model_version_stage(
-        name=MLFLOW_MODEL_NAME,
-        version=version[0].version,
-        stage=new_stage,
-        archive_existing_versions=True
-    )
-
-    print(f"✅ Model {MLFLOW_MODEL_NAME} (version {version[0].version}) transitioned from {current_stage} to {new_stage}")
-
-    return None
+    min_date = EVALUATION_START_DATE
+    max_date = str(datetime.strptime(min_date, "%Y-%m-%d") + relativedelta(months=1)).split()[0]
 
 
-def mlflow_run(func):
-    """
-    Generic function to log params and results to MLflow along with TensorFlow auto-logging
+    preprocessed = preprocess_new_data.submit(min_date=min_date, max_date=max_date)
 
-    Args:
-        - func (function): Function you want to run within the MLflow run
-        - params (dict, optional): Params to add to the run in MLflow. Defaults to None.
-        - context (str, optional): Param describing the context of the run. Defaults to "Train".
-    """
-    def wrapper(*args, **kwargs):
-        mlflow.end_run()
-        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-        mlflow.set_experiment(experiment_name=MLFLOW_EXPERIMENT)
+    old_mae = evaluate_production_model.submit(min_date=min_date, max_date=max_date, wait_for=[preprocessed])
+    new_mae = re_train.submit(min_date=min_date, max_date=max_date, split_ratio = 0.2, wait_for=[preprocessed])
 
-        with mlflow.start_run():
-            mlflow.tensorflow.autolog()
-            results = func(*args, **kwargs)
+    old_mae = old_mae.result()
+    new_mae = new_mae.result()
 
-        print("✅ mlflow_run auto-log done")
+    if new_mae < old_mae:
+        print(f"🚀 New model replacing old in production with MAE: {new_mae} the Old MAE was: {old_mae}")
+        transition_model.submit(current_stage="Staging", new_stage="Production")
+    else:
+        print(f"🚀 Old model kept in place with MAE: {old_mae}. The new MAE was: {new_mae}")
 
-        return results
-    return wrapper
+    notify.submit(old_mae, new_mae)
+
+
+if __name__ == "__main__":
+    train_flow()
